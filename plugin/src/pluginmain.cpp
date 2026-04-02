@@ -485,12 +485,14 @@ namespace
         void stop();
         void sendEvent(const char* eventName, json_t* payload);
         void sendSimpleEvent(const char* eventName);
+        void notifyDebugStateChanged();
 
     private:
         void loadConfig();
         void workerLoop();
         bool connectSocket();
         void closeSocket();
+        bool isSocketConnected();
         bool sendJson(json_t* root);
         void sendHello();
         void handleLine(const std::string & line);
@@ -540,6 +542,12 @@ namespace
         sendEvent(eventName, json_object());
     }
 
+    void BridgeAgent::notifyDebugStateChanged()
+    {
+        if(!DbgIsDebugging())
+            closeSocket();
+    }
+
     void BridgeAgent::loadConfig()
     {
         char hostBuf[128] = {};
@@ -564,22 +572,68 @@ namespace
             return;
         }
 
+        bool waitingForDebuggee = false;
         while(!stopFlag_)
         {
-            if(!connectSocket())
+            if(!DbgIsDebugging())
             {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                if(isSocketConnected())
+                    closeSocket();
+                if(!waitingForDebuggee)
+                {
+                    _plugin_logputs("[x64dbg_mcp] waiting for a debuggee before opening MCP session");
+                    waitingForDebuggee = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 continue;
             }
 
-            sendHello();
-            _plugin_logprintf("[x64dbg_mcp] connected to MCP bridge at %s:%u\n", host_.c_str(), port_);
+            waitingForDebuggee = false;
+
+            if(!isSocketConnected() && !connectSocket())
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+
+            if(isSocketConnected())
+            {
+                sendHello();
+                _plugin_logprintf("[x64dbg_mcp] connected to MCP bridge at %s:%u\n", host_.c_str(), port_);
+            }
 
             std::string buffer;
             char chunk[4096];
             while(!stopFlag_)
             {
-                int received = recv(socket_, chunk, sizeof(chunk), 0);
+                if(!DbgIsDebugging())
+                {
+                    _plugin_logputs("[x64dbg_mcp] debuggee stopped; closing MCP session");
+                    closeSocket();
+                    break;
+                }
+
+                SOCKET currentSocket = INVALID_SOCKET;
+                {
+                    std::lock_guard<std::mutex> lock(socketMutex_);
+                    currentSocket = socket_;
+                }
+                if(currentSocket == INVALID_SOCKET)
+                    break;
+
+                fd_set readSet;
+                FD_ZERO(&readSet);
+                FD_SET(currentSocket, &readSet);
+                timeval timeout = {};
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 250000;
+                int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+                if(ready == 0)
+                    continue;
+                if(ready < 0)
+                    break;
+
+                int received = recv(currentSocket, chunk, sizeof(chunk), 0);
                 if(received <= 0)
                     break;
                 buffer.append(chunk, chunk + received);
@@ -596,7 +650,7 @@ namespace
             if(!stopFlag_)
                 _plugin_logputs("[x64dbg_mcp] disconnected from MCP bridge");
             closeSocket();
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
 
         WSACleanup();
@@ -647,6 +701,12 @@ namespace
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
         }
+    }
+
+    bool BridgeAgent::isSocketConnected()
+    {
+        std::lock_guard<std::mutex> lock(socketMutex_);
+        return socket_ != INVALID_SOCKET;
     }
 
     bool BridgeAgent::sendJson(json_t* root)
@@ -1530,6 +1590,7 @@ namespace
         {
         case CB_INITDEBUG:
         {
+            g_bridgeAgent.notifyDebugStateChanged();
             auto* info = static_cast<PLUG_CB_INITDEBUG*>(callbackInfo);
             json_t* payload = json_object();
             setString(payload, "file", info ? info->szFileName : "");
@@ -1537,10 +1598,12 @@ namespace
             break;
         }
         case CB_STOPDEBUG:
+            g_bridgeAgent.notifyDebugStateChanged();
             g_bridgeAgent.sendSimpleEvent("stopdebug");
             break;
         case CB_CREATEPROCESS:
         {
+            g_bridgeAgent.notifyDebugStateChanged();
             auto* info = static_cast<PLUG_CB_CREATEPROCESS*>(callbackInfo);
             json_t* payload = json_object();
             if(info && info->fdProcessInfo)
@@ -1556,6 +1619,7 @@ namespace
             if(info && info->ExitProcess)
                 setUint32(payload, "exit_code", info->ExitProcess->dwExitCode);
             g_bridgeAgent.sendEvent("exitprocess", payload);
+            g_bridgeAgent.notifyDebugStateChanged();
             break;
         }
         case CB_CREATETHREAD:
@@ -1626,6 +1690,7 @@ namespace
             break;
         case CB_ATTACH:
         {
+            g_bridgeAgent.notifyDebugStateChanged();
             auto* info = static_cast<PLUG_CB_ATTACH*>(callbackInfo);
             json_t* payload = json_object();
             if(info)
@@ -1634,6 +1699,7 @@ namespace
             break;
         }
         case CB_DETACH:
+            g_bridgeAgent.notifyDebugStateChanged();
             g_bridgeAgent.sendSimpleEvent("detach");
             break;
         default:
